@@ -198,7 +198,25 @@ async function request<T>(
     if (controller?.signal.aborted) {
       throw new Error(`Request timed out after ${timeoutMs}ms`)
     }
-    throw err
+    // 针对幂等的 GET 请求在遭遇网络传输层断开（如 HTTP Keep-Alive 竞争重置、偶发丢包）时进行一次快速重试
+    const isGet = !fetchOptions.method || fetchOptions.method.toUpperCase() === 'GET'
+    if (isGet && !fetchOptions.signal?.aborted) {
+      try {
+        response = await fetch(`${API_BASE}${url}`, {
+          headers: {
+            'Content-Type': 'application/json',
+            ...fetchOptions.headers,
+          },
+          credentials: 'same-origin',
+          ...fetchOptions,
+          signal: controller?.signal ?? fetchOptions.signal,
+        })
+      } catch {
+        throw err
+      }
+    } else {
+      throw err
+    }
   } finally {
     if (timeoutId !== undefined) window.clearTimeout(timeoutId)
   }
@@ -473,8 +491,9 @@ export class SimAdminCurrentAPI {
     })
   }
 
-  async getCachedEsimProfiles() {
-    return this.request<ApiResponse<EsimProfilesResponse>>('/esim/profiles?cached=1', {
+  async getCachedEsimProfiles(eid?: string) {
+    const path = eid ? `/esim/profiles?cached=1&eid=${encodeURIComponent(eid)}` : '/esim/profiles?cached=1'
+    return this.request<ApiResponse<EsimProfilesResponse>>(path, {
       timeoutMs: 5000,
     })
   }

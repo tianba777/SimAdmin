@@ -89,6 +89,9 @@ type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperti
 static MODEM_DISCOVERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static MODEM_DISCOVERY_FAILURE: std::sync::Mutex<Option<(Instant, String)>> =
     std::sync::Mutex::new(None);
+static LAST_MODEM_AUTO_RECOVERY: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+const MODEM_AUTO_RECOVERY_COOLDOWN_SECS: u64 = 180;
 static BASEBAND_RESTART_STEPS: std::sync::Mutex<Vec<BasebandRestartStep>> =
     std::sync::Mutex::new(Vec::new());
 static BASEBAND_RESTART_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -1099,6 +1102,89 @@ fn clear_modem_discovery_failure() {
     }
 }
 
+#[cfg(unix)]
+pub async fn try_recover_stuck_modem(reason: &str) -> bool {
+    let should_run = {
+        let Ok(mut guard) = LAST_MODEM_AUTO_RECOVERY.lock() else {
+            return false;
+        };
+        if let Some(last) = *guard {
+            if last.elapsed() < Duration::from_secs(MODEM_AUTO_RECOVERY_COOLDOWN_SECS) {
+                return false;
+            }
+        }
+        *guard = Some(Instant::now());
+        true
+    };
+
+    if !should_run {
+        return false;
+    }
+
+    warn!(reason = %reason, "Triggering active modem recovery pipeline");
+
+    if let Some(qmi_path) = find_qmi_device_path() {
+        if let Ok(mode_out) = run_recovery_command_owned(
+            "qmicli",
+            &[
+                "-d".to_string(),
+                qmi_path.clone(),
+                "--device-open-proxy".to_string(),
+                "--dms-get-operating-mode".to_string(),
+            ],
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            let lower = mode_out.to_lowercase();
+            if lower.contains("shutting-down")
+                || lower.contains("low-power")
+                || lower.contains("offline")
+            {
+                warn!(
+                    qmi_device = %qmi_path,
+                    mode = %mode_out,
+                    "QMI operating mode is restricted; restoring online mode"
+                );
+                let _ = run_recovery_command_owned(
+                    "qmicli",
+                    &[
+                        "-d".to_string(),
+                        qmi_path.clone(),
+                        "--device-open-proxy".to_string(),
+                        "--dms-set-operating-mode=online".to_string(),
+                    ],
+                    Duration::from_secs(10),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    info!("Restarting ModemManager to re-enumerate modem devices");
+    let restart_res = run_recovery_command_owned(
+        "systemctl",
+        &["restart".to_string(), "ModemManager.service".to_string()],
+        Duration::from_secs(15),
+    )
+    .await;
+    if let Err(e) = restart_res {
+        warn!(error = %e, "Failed to restart ModemManager during recovery");
+        return false;
+    }
+
+    clear_modem_discovery_failure();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    true
+}
+
+#[cfg(not(unix))]
+pub async fn try_recover_stuck_modem(_reason: &str) -> bool {
+    false
+}
+
+
 pub async fn find_modem_path(conn: &Connection) -> zbus::Result<String> {
     if let Some(path) = list_modem_paths(conn).await?.into_iter().next() {
         clear_modem_discovery_failure();
@@ -1950,6 +2036,19 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
         data.mnc.as_deref().unwrap_or_default(),
         &data.operator_name,
     );
+
+    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM)
+        .await
+        .unwrap_or_default();
+    let dbus_quality = modem_props
+        .get("SignalQuality")
+        .and_then(|value| <(u32, bool)>::try_from(value.clone()).ok())
+        .map(|(q, _)| q)
+        .unwrap_or(0);
+    if dbus_quality == 0 && matches!(data.registration_status.as_str(), "registered" | "roaming") {
+        poke_signal_quality_if_needed();
+    }
+
     Ok(data)
 }
 
@@ -2453,9 +2552,33 @@ mod tests {
             (true, vec!["wwan0".to_string()])
         );
         assert_eq!(
+            parse_nm_connection_runtime_state("activated\nwwan0qmi0\nwwan0\n"),
+            (true, vec!["wwan0qmi0".to_string(), "wwan0".to_string()])
+        );
+        assert_eq!(
             parse_nm_connection_runtime_state("deactivated\n--\n"),
             (false, Vec::<String>::new())
         );
+    }
+
+    #[test]
+    fn equivalent_interface_name_matches_qmi_control_and_data_netdev() {
+        assert!(is_equivalent_interface_name("wwan0qmi0", "wwan0"));
+        assert!(is_equivalent_interface_name("wwan0at0", "wwan0"));
+        assert!(is_equivalent_interface_name("wwan0", "wwan0qmi0"));
+        assert!(!is_equivalent_interface_name("wwan1qmi1", "wwan0"));
+        assert!(!is_equivalent_interface_name("usb0", "wwan0"));
+    }
+
+    #[test]
+    fn isolates_special_apns_from_regular_cellular_data() {
+        assert!(is_isolated_special_apn("ims"));
+        assert!(is_isolated_special_apn("IMS"));
+        assert!(is_isolated_special_apn("sos"));
+        assert!(is_isolated_special_apn("emergency"));
+        assert!(!is_isolated_special_apn("3gnet"));
+        assert!(!is_isolated_special_apn("cmnet"));
+        assert!(!is_isolated_special_apn("ctnet"));
     }
 
     #[test]
@@ -3094,6 +3217,36 @@ pub async fn stop_cell_monitoring() -> Result<(), String> {
 
 async fn send_mm_at_command(proxy: &Proxy<'_>, cmd: &str) -> Option<String> {
     proxy.call("Command", &(cmd, 3u32)).await.ok()
+}
+
+static LAST_SIGNAL_POKE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn poke_signal_quality_if_needed() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_SIGNAL_POKE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 30 {
+        return;
+    }
+    if LAST_SIGNAL_POKE_SECS
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let _ = run_recovery_command("mmcli", &["-m", "any", "--signal-setup=1"]).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        let _ = run_recovery_command("mmcli", &["-m", "any", "--signal-setup=0"]).await;
+    });
 }
 
 pub fn lte_band_from_earfcn(earfcn: u32) -> Option<&'static str> {
@@ -3884,6 +4037,14 @@ fn simple_connect_settings_from_bearer_props(props: &InterfaceProperties) -> Sim
     }
 }
 
+pub(crate) fn is_isolated_special_apn(apn: &str) -> bool {
+    let lower = apn.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "ims" | "sos" | "emergency" | "xcap" | "mms" | "hos"
+    )
+}
+
 async fn read_bearer_simple_connect_settings(
     conn: &Connection,
     modem_path: &str,
@@ -3901,10 +4062,16 @@ async fn read_bearer_simple_connect_settings(
         match get_all_properties(conn, &path, MM_BEARER).await {
             Ok(props) => {
                 let settings = simple_connect_settings_from_bearer_props(&props);
-                if settings.has_apn() {
+                let is_special = settings
+                    .apn
+                    .as_deref()
+                    .is_some_and(is_isolated_special_apn);
+                if settings.has_apn() && !is_special {
                     return settings;
                 }
-                selected.fill_missing_from(settings);
+                if !is_special {
+                    selected.fill_missing_from(settings);
+                }
             }
             Err(err) => {
                 warn!(path = %path, error = %err, "Failed to read ModemManager bearer properties for APN lookup");
@@ -4050,6 +4217,26 @@ fn has_usable_data_address(interface: &NetworkInterfaceInfo) -> bool {
     })
 }
 
+fn is_equivalent_interface_name(candidate: &str, interface_name: &str) -> bool {
+    if candidate == interface_name {
+        return true;
+    }
+    // E.g. NetworkManager control device "wwan0qmi0" or "wwan0at0" matches network interface "wwan0"
+    if candidate.starts_with(interface_name) {
+        let suffix = &candidate[interface_name.len()..];
+        if suffix.starts_with("qmi") || suffix.starts_with("at") {
+            return true;
+        }
+    }
+    if interface_name.starts_with(candidate) {
+        let suffix = &interface_name[candidate.len()..];
+        if suffix.starts_with("qmi") || suffix.starts_with("at") {
+            return true;
+        }
+    }
+    false
+}
+
 fn data_path_health_from_interfaces(
     control_plane_connected: bool,
     profile_active: bool,
@@ -4077,7 +4264,11 @@ fn data_path_health_from_interfaces(
 
     let matched_interfaces = interfaces
         .iter()
-        .filter(|interface| profile_interfaces.iter().any(|name| name == &interface.name))
+        .filter(|interface| {
+            profile_interfaces.iter().any(|name| {
+                name == &interface.name || is_equivalent_interface_name(name, &interface.name)
+            })
+        })
         .collect::<Vec<_>>();
     let selected = matched_interfaces
         .iter()
@@ -4650,6 +4841,21 @@ async fn set_modem_enabled(
     wait_for_modem_state(conn, modem_path, Duration::from_secs(15), desired_ready).await
 }
 
+async fn cycle_modem_radio_deep(conn: &Connection, modem_path: &str) -> Result<(), String> {
+    // 使用 3GPP 标准飞行模式（AT+CFUN=4）：仅关闭/复发射频收发电路与网络协议栈，清除基带搜网死锁与退避缓存，
+    // 且严格保持 UIM/SIM 卡物理电源在线，彻底避免高通等基带固件在 AT+CFUN=0 时切断 SIM 卡电源导致 modem 判定为 sim-missing 崩溃。
+    if let Ok(proxy) = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await {
+        let _ = send_mm_at_command(&proxy, "AT+CFUN=4").await;
+    }
+    let _ = set_modem_enabled(conn, modem_path, false).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let res = set_modem_enabled(conn, modem_path, true).await;
+    if let Ok(proxy) = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await {
+        let _ = send_mm_at_command(&proxy, "AT+CFUN=1").await;
+    }
+    res.map(|_| ())
+}
+
 async fn recover_after_registration_failure(
     conn: &Connection,
     modem_path: &str,
@@ -4692,7 +4898,7 @@ pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeRe
 pub async fn get_signal_strength(conn: &Connection) -> zbus::Result<SignalStrengthResponse> {
     let modem_path = find_modem_path(conn).await?;
     let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let strength = modem_props
+    let mut strength = modem_props
         .get("SignalQuality")
         .and_then(|value| {
             <(u32, bool)>::try_from(value.clone())
@@ -4700,6 +4906,31 @@ pub async fn get_signal_strength(conn: &Connection) -> zbus::Result<SignalStreng
                 .map(|(q, _)| q as i32)
         })
         .unwrap_or(0);
+
+    if strength == 0 {
+        let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP)
+            .await
+            .unwrap_or_default();
+        let reg_state = gpp_props
+            .get("RegistrationState")
+            .map(extract_u32)
+            .unwrap_or(0);
+        if matches!(reg_state, 1 | 5) {
+            poke_signal_quality_if_needed();
+            let proxy = Proxy::new(
+                conn,
+                MM_SERVICE,
+                modem_path.as_str(),
+                MM_MODEM,
+            )
+            .await?;
+            if let Some(resp) = send_mm_at_command(&proxy, "AT+CSQ").await {
+                if let Some(pct) = simadmin_device_runtime::parse_csq_percentage(&resp) {
+                    strength = pct as i32;
+                }
+            }
+        }
+    }
 
     Ok(SignalStrengthResponse { strength })
 }
@@ -6243,12 +6474,13 @@ fn parse_nm_connection_runtime_state(output: &str) -> (bool, Vec<String>) {
     let profile_active = values
         .next()
         .is_some_and(nm_connection_state_is_activated);
-    let devices = values
+    let mut devices: Vec<String> = values
         .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "--")
         .map(str::to_string)
         .collect();
+    devices.dedup();
     (profile_active, devices)
 }
 
@@ -6258,7 +6490,7 @@ async fn nm_connection_runtime_state(profile: &str) -> Result<(bool, Vec<String>
         &[
             "--terse".into(),
             "--get-values".into(),
-            "GENERAL.STATE,GENERAL.DEVICES".into(),
+            "GENERAL.STATE,GENERAL.DEVICES,GENERAL.IP-IFACE".into(),
             "connection".into(),
             "show".into(),
             profile.into(),
@@ -6891,10 +7123,12 @@ pub async fn data_connection_watchdog(
     let mut last_data_activation_attempt_at: Option<Instant> = None;
     let mut transition_stuck_count = 0u32;
     let mut enabled_idle_count = 0u32;
+    let mut failed_state_count = 0u32;
     let mut cellular_problem_active = false;
     let mut data_activation_failure_active = false;
     const TRANSITION_STUCK_THRESHOLD: u32 = 6;
     const ENABLED_IDLE_RECOVERY_THRESHOLD: u32 = 8;
+    const FAILED_STATE_RECOVERY_THRESHOLD: u32 = 6;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
@@ -6950,6 +7184,9 @@ pub async fn data_connection_watchdog(
                     if state != 6 {
                         enabled_idle_count = 0;
                     }
+                    if state != -1 {
+                        failed_state_count = 0;
+                    }
                     if !data_connection_transition_in_progress(state) {
                         transition_stuck_count = 0;
                     }
@@ -6964,13 +7201,6 @@ pub async fn data_connection_watchdog(
                         } else {
                             "Airplane mode requested, not reconnecting".to_string()
                         }
-                    } else if user_disabled.load(Ordering::SeqCst) {
-                        last_data_activation_attempt_at = None;
-                        enabled_idle_count = 0;
-                        searching_count = 0;
-                        auto_register_requested_for_search = false;
-                        transition_stuck_count = 0;
-                        "User disabled cellular data, not reconnecting".to_string()
                     } else if state == 6 {
                         enabled_idle_count += 1;
                         if enabled_idle_count < ENABLED_IDLE_RECOVERY_THRESHOLD {
@@ -6980,27 +7210,22 @@ pub async fn data_connection_watchdog(
                             )
                         } else {
                             enabled_idle_count = 0;
-                            match set_modem_enabled(&conn, &modem_path, false).await {
-                                Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
-                                    Ok(_) => {
-                                        cellular_problem_active = true;
-                                        system_events
-                                            .emit_code(
-                                                system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                                system_event_severity::WARNING,
-                                                system_event_status::TRIGGERED,
-                                                modem_path.to_string(),
-                                                "Modem enabled but idle, watchdog cycled radio state",
-                                            )
-                                            .await;
-                                        "Modem enabled but idle, cycled radio state".to_string()
-                                    }
-                                    Err(err) => {
-                                        format!("Modem enabled but idle, re-enable failed: {err}")
-                                    }
-                                },
+                            match cycle_modem_radio_deep(&conn, &modem_path).await {
+                                Ok(_) => {
+                                    cellular_problem_active = true;
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            "Modem enabled but idle, watchdog cycled radio state",
+                                        )
+                                        .await;
+                                    "Modem enabled but idle, cycled radio state".to_string()
+                                }
                                 Err(err) => {
-                                    format!("Modem enabled but idle, disable failed: {err}")
+                                    format!("Modem enabled but idle, radio cycle failed: {err}")
                                 }
                             }
                         }
@@ -7019,32 +7244,24 @@ pub async fn data_connection_watchdog(
                             last_searching_recovery_at = Some(Instant::now());
                             searching_count = 0;
                             auto_register_requested_for_search = false;
-                            match set_modem_enabled(&conn, &modem_path, false).await {
+                            match cycle_modem_radio_deep(&conn, &modem_path).await {
                                 Ok(_) => {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                    match set_modem_enabled(&conn, &modem_path, true).await {
-                                        Ok(_) => {
-                                            cellular_problem_active = true;
-                                            system_events
-                                                .emit_code(
-                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                                    system_event_severity::WARNING,
-                                                    system_event_status::TRIGGERED,
-                                                    modem_path.to_string(),
-                                                    "长时间 searching，watchdog 已循环射频状态",
-                                                )
-                                                .await;
-                                            "Searching for too long, cycled radio state".to_string()
-                                        }
-                                        Err(err) => {
-                                            format!(
-                                                "Searching for too long, re-enable failed: {err}"
-                                            )
-                                        }
-                                    }
+                                    cellular_problem_active = true;
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            "长时间 searching，watchdog 已执行深度射频复位",
+                                        )
+                                        .await;
+                                    "Searching for too long, cycled radio state (deep reset)".to_string()
                                 }
                                 Err(err) => {
-                                    format!("Searching for too long, disable failed: {err}")
+                                    format!(
+                                        "Searching for too long, radio reset failed: {err}"
+                                    )
                                 }
                             }
                         } else if searching_count >= SEARCHING_REGISTER_THRESHOLD
@@ -7093,6 +7310,40 @@ pub async fn data_connection_watchdog(
                             format!(
                                 "Waiting for registration (state: searching, registration: {}, attempts: {searching_count})",
                                 mm_registration_to_string(registration)
+                            )
+                        }
+                    } else if state == -1 {
+                        failed_state_count += 1;
+                        if failed_state_count >= FAILED_STATE_RECOVERY_THRESHOLD {
+                            failed_state_count = 0;
+                            warn!(
+                                "Modem permanently stuck in failed state, triggering recovery"
+                            );
+                            // 若存在 QMI 设备，尝试确保 SIM 卡处于上电状态
+                            if let Some(qmi_dev) = find_qmi_device_path() {
+                                let _ = qmicli_sim_power(&qmi_dev, true).await;
+                            }
+                            match run_recovery_command("systemctl", &["restart", "ModemManager"]).await {
+                                Ok(_) => {
+                                    cellular_problem_active = true;
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::BASEBAND_MODEMMANAGER_RESTARTED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            "Modem 状态处于 failed，watchdog 已重启 ModemManager 恢复",
+                                        )
+                                        .await;
+                                    "Modem in failed state, restarted ModemManager".to_string()
+                                }
+                                Err(err) => {
+                                    format!("Modem in failed state, restart ModemManager failed: {err}")
+                                }
+                            }
+                        } else {
+                            format!(
+                                "Waiting for registration (state: failed, attempts: {failed_state_count}/{FAILED_STATE_RECOVERY_THRESHOLD})"
                             )
                         }
                     } else if state < MM_MODEM_STATE_REGISTERED {
@@ -7188,32 +7439,26 @@ pub async fn data_connection_watchdog(
                                 state = mm_state_to_string(state),
                                 "Modem stuck in transition state, cycling radio"
                             );
-                            match set_modem_enabled(&conn, &modem_path, false).await {
+                            match cycle_modem_radio_deep(&conn, &modem_path).await {
                                 Ok(_) => {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                    match set_modem_enabled(&conn, &modem_path, true).await {
-                                        Ok(_) => {
-                                            cellular_problem_active = true;
-                                            system_events
-                                                .emit_code(
-                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                                    system_event_severity::WARNING,
-                                                    system_event_status::TRIGGERED,
-                                                    modem_path.to_string(),
-                                                    format!(
-                                                        "数据连接状态卡住，已循环射频状态: {}",
-                                                        mm_state_to_string(state)
-                                                    ),
-                                                )
-                                                .await;
-                                            "Transition stuck, cycled radio state".to_string()
-                                        }
-                                        Err(err) => {
-                                            format!("Transition stuck, re-enable failed: {err}")
-                                        }
-                                    }
+                                    cellular_problem_active = true;
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::TRIGGERED,
+                                            modem_path.to_string(),
+                                            format!(
+                                                "数据连接状态卡住，已循环射频状态: {}",
+                                                mm_state_to_string(state)
+                                            ),
+                                        )
+                                        .await;
+                                    "Transition stuck, cycled radio state".to_string()
                                 }
-                                Err(err) => format!("Transition stuck, disable failed: {err}"),
+                                Err(err) => {
+                                    format!("Transition stuck, radio cycle failed: {err}")
+                                }
                             }
                         } else {
                             format!(
